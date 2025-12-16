@@ -3,6 +3,7 @@ import time
 import json
 import os
 import math
+import re
 
 TOKEN = "8432572527:AAEQVRWvbSbrMfIBLidcjBvEg26JAwtHke8"
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
@@ -61,6 +62,7 @@ user_videos = {}
 bot_messages = {}
 all_messages = {}
 video_messages = {}
+user_photos = {}  # Track user's photos to keep them
 started_users = set()
 
 STATE_FILE = "bot_state.json"
@@ -177,9 +179,17 @@ def handle_text(chat_id, text):
         user_waiting_quality.discard(chat_id)
         save_state()
 
-        # Activate the bot and show current settings
-        send_message(chat_id, get_start_text(chat_id))
-        send_message(chat_id, "Bot activated and reset: episode set to 1, quality cleared. Use /autocaption to set quality.")
+        # Show quality selection directly
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "480p (1x)", "callback_data": "480"}],
+                [{"text": "720p (2x)", "callback_data": "720"}],
+                [{"text": "1080p (3x)", "callback_data": "1080"}],
+                [{"text": "2160p (4x)", "callback_data": "2160"}]
+            ]
+        }
+        send_message(chat_id, "Select Quality:", json.dumps(keyboard))
+        user_waiting_quality.add(chat_id)
     elif text == '/stop' or text.startswith('/stop@'):
         if chat_id in started_users:
             started_users.discard(chat_id)
@@ -204,7 +214,6 @@ def handle_text(chat_id, text):
                 [{"text": "2160p (4x)", "callback_data": "2160"}]
             ]
         }
-        import json
         send_message(chat_id, "Select Quality:", json.dumps(keyboard))
         user_waiting_quality.add(chat_id)
         save_state()
@@ -217,67 +226,44 @@ def handle_text(chat_id, text):
         print(f"Server refreshed by user {chat_id}")
         save_state()
     elif text == '/del' or text.startswith('/del@'):
-        # In channels/groups: delete all bot text messages and other non-video messages,
-        # but keep forwarded/sent videos with captions (tracked in `video_messages`).
         if chat_id < 0:
             if chat_id in all_messages and len(all_messages[chat_id]) > 0:
-                # If bot is admin, delete everything (including user messages & videos)
                 if is_bot_admin(chat_id):
-                    deleted_count = 0
                     for message_id in list(all_messages.get(chat_id, [])):
                         delete_message(chat_id, message_id)
-                        deleted_count += 1
-                        time.sleep(0.1)
                     all_messages[chat_id] = []
                     bot_messages[chat_id] = []
                     video_messages[chat_id] = []
-                    print(f"Admin delete: Deleted ALL {deleted_count} messages for channel {chat_id}")
+                    user_photos[chat_id] = []
+                    print(f"Admin delete: Deleted ALL messages for channel {chat_id}")
                 else:
-                    to_keep = set(video_messages.get(chat_id, []))
-                    deleted_count = 0
+                    to_keep = set(video_messages.get(chat_id, [])) | set(user_photos.get(chat_id, []))
                     remaining = []
                     for message_id in all_messages.get(chat_id, []):
                         if message_id in to_keep:
                             remaining.append(message_id)
                         else:
                             delete_message(chat_id, message_id)
-                            deleted_count += 1
-                            time.sleep(0.1)
                     all_messages[chat_id] = remaining
-                    # Clear bot_messages for this chat since text messages are deleted
                     bot_messages[chat_id] = []
-                    print(f"Deleted {deleted_count} messages for channel {chat_id}; kept {len(remaining)} video(s)")
-            else:
-                print(f"No messages to delete for chat {chat_id}")
+                    print(f"Deleted messages for channel {chat_id}; kept {len(remaining)} items")
         else:
-            # Private chat/group non-channel behavior: delete bot text messages only
             if chat_id in bot_messages:
-                deleted_ids = []
-                deleted_count = 0
+                deleted_ids = set(bot_messages[chat_id])
                 for message_id in bot_messages[chat_id]:
                     delete_message(chat_id, message_id)
-                    deleted_ids.append(message_id)
-                    deleted_count += 1
-                    time.sleep(0.1)
                 bot_messages[chat_id] = []
-                # Remove deleted ids from all_messages as well
                 if chat_id in all_messages:
-                    all_messages[chat_id] = [m for m in all_messages[chat_id] if m not in set(deleted_ids)]
-                print(f"Deleted {deleted_count} bot messages for chat {chat_id}")
-            else:
-                print(f"No messages to delete for chat {chat_id}")
+                    all_messages[chat_id] = [m for m in all_messages[chat_id] if m not in deleted_ids]
+                print(f"Deleted bot messages for chat {chat_id}")
     elif text == '/all_del' or text.startswith('/all_del@'):
         if chat_id in all_messages:
-            deleted_count = 0
             for message_id in all_messages[chat_id]:
                 delete_message(chat_id, message_id)
-                deleted_count += 1
-                time.sleep(0.1)
             all_messages[chat_id] = []
             bot_messages[chat_id] = []
-            print(f"Deleted ALL {deleted_count} messages for chat {chat_id}")
-        else:
-            print(f"No messages to delete for chat {chat_id}")
+            video_messages[chat_id] = []
+            print(f"Deleted ALL messages for chat {chat_id}")
     elif chat_id in user_waiting_quality and text in ['480', '720', '1080', '2160']:
         user_quality[chat_id] = text
         user_waiting_quality.remove(chat_id)
@@ -285,10 +271,41 @@ def handle_text(chat_id, text):
         save_state()
 
 
-def handle_video(chat_id, video_file_id):
+def extract_episode_from_text(text):
+    """Extract episode number from text using regex patterns."""
+    if not text:
+        return None
+    
+    text = text.strip()
+    print(f"Attempting to extract episode from: '{text}'")
+    
+    # Patterns ordered by specificity
+    patterns = [
+        r'(?:episode|ep|e)[\s:_-]+(\d{1,4})',  # Episode 12, EP:12, E-12, E_12
+        r'\[(\d{1,4})\]',  # [12]
+        r'(?:^|\s)(\d{1,3})(?:st|nd|rd|th)?\s*(?:episode|ep)',  # 12th episode
+        r'-\s*(\d{1,4})\s*-',  # - 12 -
+        r'\b(\d{1,4})\s*(?:of|/)',  # 12 of, 12/
+        r'(?:^|\D)(\d{1,3})(?:\s|$)'  # Standalone number
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            ep_num = int(match.group(1))
+            if 1 <= ep_num <= 9999:
+                print(f"✓ Detected episode: {ep_num}")
+                return ep_num
+    
+    print("✗ No episode detected")
+    return None
+
+def handle_video(chat_id, video_file_id, caption=None, filename=None):
     global episode_counter
     chat_type = "group/channel" if chat_id < 0 else "private"
     print(f"Received video from {chat_type} chat_id: {chat_id}")
+    print(f"Caption: {caption}")
+    print(f"Filename: {filename}")
 
     # Require the user to select quality first
     if chat_id not in user_quality:
@@ -298,6 +315,19 @@ def handle_video(chat_id, video_file_id):
     if chat_id not in started_users and chat_id > 0:
         send_message(chat_id, "Please send /start first to activate the bot! 🚀")
         return
+    
+    # Auto-detect episode from caption or filename (only on first video)
+    if chat_id not in user_videos or len(user_videos.get(chat_id, [])) == 0:
+        detected_ep = None
+        if caption:
+            detected_ep = extract_episode_from_text(caption)
+        if not detected_ep and filename:
+            detected_ep = extract_episode_from_text(filename)
+        
+        if detected_ep:
+            episode_counters[chat_id] = detected_ep
+            save_state()
+            print(f"✓ Episode counter set to {detected_ep}")
 
     max_quality = user_quality.get(chat_id, '480')
 
@@ -330,9 +360,6 @@ def handle_video(chat_id, video_file_id):
         episode_counters[chat_id] = ep + 1
         save_state()
         print(f"Processed episode {ep} with {required_videos} different quality videos")
-    else:
-        remaining = required_videos - len(user_videos[chat_id])
-        send_message(chat_id, f"Video {len(user_videos[chat_id])}/{required_videos} received. Send {remaining} more video(s) for {max_quality}p quality.")
 
 def send_message(chat_id, text, keyboard=None):
     url = f"{BASE_URL}/sendMessage"
@@ -472,12 +499,6 @@ def main():
                     
                     elif 'message' in update:
                         chat_id = update['message']['chat']['id']
-                        # Track incoming user message ids so admin /del can remove them
-                        msg_id = update['message'].get('message_id')
-                        if msg_id is not None:
-                            if chat_id not in all_messages:
-                                all_messages[chat_id] = []
-                            all_messages[chat_id].append(msg_id)
                         chat_type = "group/channel" if chat_id < 0 else "private"
                         print(f"Received message from {chat_type} chat_id: {chat_id}")
                         
@@ -486,29 +507,39 @@ def main():
                             started_users.add(chat_id)
                         
                         if 'text' in update['message']:
+                            # Track text messages
+                            msg_id = update['message'].get('message_id')
+                            if msg_id is not None:
+                                if chat_id not in all_messages:
+                                    all_messages[chat_id] = []
+                                all_messages[chat_id].append(msg_id)
                             text = update['message']['text']
                             handle_text(chat_id, text)
                         
+                        elif 'photo' in update['message']:
+                            # Track user's photo messages to preserve them
+                            photo_msg_id = update['message'].get('message_id')
+                            if photo_msg_id is not None:
+                                if chat_id not in user_photos:
+                                    user_photos[chat_id] = []
+                                user_photos[chat_id].append(photo_msg_id)
+                        
                         elif 'video' in update['message']:
-                            # Track user's video message id as well
+                            # Track user's incoming video in all_messages (will be deleted)
                             vid_msg_id = update['message'].get('message_id')
                             if vid_msg_id is not None:
                                 if chat_id not in all_messages:
                                     all_messages[chat_id] = []
                                 all_messages[chat_id].append(vid_msg_id)
                             video_file_id = update['message']['video']['file_id']
-                            handle_video(chat_id, video_file_id)
+                            caption = update['message'].get('caption', '')
+                            filename = update['message']['video'].get('file_name', '')
+                            handle_video(chat_id, video_file_id, caption, filename)
 
                     # Handle posts in channels (they appear as 'channel_post' in updates)
                     elif 'channel_post' in update:
                         post = update['channel_post']
                         chat_id = post['chat']['id']
-                        # Track incoming channel_post ids so admin /del can remove them
-                        post_id = post.get('message_id')
-                        if post_id is not None:
-                            if chat_id not in all_messages:
-                                all_messages[chat_id] = []
-                            all_messages[chat_id].append(post_id)
                         chat_type = "group/channel" if chat_id < 0 else "private"
                         print(f"Received channel_post from {chat_type} chat_id: {chat_id}")
 
@@ -517,12 +548,34 @@ def main():
                             started_users.add(chat_id)
 
                         if 'text' in post:
+                            # Track text posts
+                            post_id = post.get('message_id')
+                            if post_id is not None:
+                                if chat_id not in all_messages:
+                                    all_messages[chat_id] = []
+                                all_messages[chat_id].append(post_id)
                             text = post['text']
                             handle_text(chat_id, text)
+                        
+                        elif 'photo' in post:
+                            # Track channel photos to preserve them
+                            photo_post_id = post.get('message_id')
+                            if photo_post_id is not None:
+                                if chat_id not in user_photos:
+                                    user_photos[chat_id] = []
+                                user_photos[chat_id].append(photo_post_id)
 
-                        if 'video' in post:
+                        elif 'video' in post:
+                            # Track incoming video in all_messages (will be deleted)
+                            vid_post_id = post.get('message_id')
+                            if vid_post_id is not None:
+                                if chat_id not in all_messages:
+                                    all_messages[chat_id] = []
+                                all_messages[chat_id].append(vid_post_id)
                             video_file_id = post['video']['file_id']
-                            handle_video(chat_id, video_file_id)
+                            caption = post.get('caption', '')
+                            filename = post['video'].get('file_name', '')
+                            handle_video(chat_id, video_file_id, caption, filename)
             
             time.sleep(1)
         except Exception as e:
