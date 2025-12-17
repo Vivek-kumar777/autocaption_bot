@@ -5,7 +5,7 @@ import os
 import math
 import re
 
-TOKEN = "8228183877:AAGdJHc53yDreIldh-EFX-nOMnCgHdc9yvA"
+TOKEN = "8432572527:AAEQVRWvbSbrMfIBLidcjBvEg26JAwtHke8"
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 BOT_ID = None
 BOT_USERNAME = None
