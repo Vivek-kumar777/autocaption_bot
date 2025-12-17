@@ -5,7 +5,7 @@ import os
 import math
 import re
 
-TOKEN = "8432572527:AAEQVRWvbSbrMfIBLidcjBvEg26JAwtHke8"
+TOKEN = "8228183877:AAGdJHc53yDreIldh-EFX-nOMnCgHdc9yvA"
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 BOT_ID = None
 BOT_USERNAME = None
@@ -276,24 +276,27 @@ def extract_episode_from_text(text):
     if not text:
         return None
     
+    original = text
     text = text.strip()
     print(f"Attempting to extract episode from: '{text}'")
     
-    # Patterns ordered by specificity
+    # Patterns ordered by priority (most specific first)
     patterns = [
-        r'(?:episode|ep|e)[\s:_-]+(\d{1,4})',  # Episode 12, EP:12, E-12, E_12
-        r'\[(\d{1,4})\]',  # [12]
-        r'(?:^|\s)(\d{1,3})(?:st|nd|rd|th)?\s*(?:episode|ep)',  # 12th episode
-        r'-\s*(\d{1,4})\s*-',  # - 12 -
-        r'\b(\d{1,4})\s*(?:of|/)',  # 12 of, 12/
-        r'(?:^|\D)(\d{1,3})(?:\s|$)'  # Standalone number
+        r'[:\s]+(\d{2})(?:,|\s)',  # : 02, or space 02,
+        r's\d+e(\d{2,3})',  # S01E02
+        r'episode[\s:_-]+(\d{1,3})',  # episode 12
+        r'\bep[\s:_-]+(\d{1,3})',  # ep 12
+        r'\be(\d{1,3})\b',  # e12
+        r'\[(\d{1,3})\]',  # [12]
+        r'-\s*(\d{1,3})\s*-',  # - 12 -
     ]
     
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             ep_num = int(match.group(1))
-            if 1 <= ep_num <= 9999:
+            # Validate: exclude quality numbers, year-like numbers, and invalid ranges
+            if ep_num not in [480, 720, 1080, 2160] and not (1900 <= ep_num <= 2100) and 1 <= ep_num <= 999:
                 print(f"✓ Detected episode: {ep_num}")
                 return ep_num
     
@@ -316,7 +319,7 @@ def handle_video(chat_id, video_file_id, caption=None, filename=None):
         send_message(chat_id, "Please send /start first to activate the bot! 🚀")
         return
     
-    # Auto-detect episode from caption or filename (only on first video)
+    # Auto-detect episode from caption or filename on every first video of batch
     if chat_id not in user_videos or len(user_videos.get(chat_id, [])) == 0:
         detected_ep = None
         if caption:
@@ -357,6 +360,7 @@ def handle_video(chat_id, video_file_id, caption=None, filename=None):
             time.sleep(1)
 
         user_videos[chat_id] = []
+        # Only auto-increment if no episode was detected
         episode_counters[chat_id] = ep + 1
         save_state()
         print(f"Processed episode {ep} with {required_videos} different quality videos")
@@ -492,10 +496,30 @@ def main():
                         callback_data = {'callback_query_id': update['callback_query']['id']}
                         requests.post(callback_url, data=callback_data)
                         
-                        send_message(chat_id, f"Quality set to {quality}p!")
-                        # Ask for episode number to start from (works in private and channels)
-                        send_message(chat_id, "Please send the episode number to start from (e.g., 5).")
+                        # Delete the quality selection message
+                        quality_msg_id = update['callback_query']['message'].get('message_id')
+                        if quality_msg_id:
+                            delete_message(chat_id, quality_msg_id)
+                        
+                        # Send messages and schedule deletion
+                        msg1 = send_message(chat_id, f"Quality set to {quality}p!")
+                        msg2 = send_message(chat_id, "Please send the episode number to start from (e.g., 5).")
                         user_waiting_episode.add(chat_id)
+                        
+                        # Delete messages after 2 seconds
+                        time.sleep(2)
+                        if msg1:
+                            try:
+                                result1 = msg1.json()
+                                if result1.get('ok'):
+                                    delete_message(chat_id, result1['result']['message_id'])
+                            except: pass
+                        if msg2:
+                            try:
+                                result2 = msg2.json()
+                                if result2.get('ok'):
+                                    delete_message(chat_id, result2['result']['message_id'])
+                            except: pass
                     
                     elif 'message' in update:
                         chat_id = update['message']['chat']['id']
